@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import hashlib
 import importlib
 import inspect
 import json
@@ -37,6 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
@@ -64,6 +66,27 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _ids_tensor_to_list(input_ids):
+    """Convert a token-ids tensor to a plain int list.
+
+    ``mx.array.tolist()`` recurses per element in Python (~30 us/token,
+    seconds on 100K+ prompts); the numpy buffer round-trip is orders of
+    magnitude faster. Fall back to the native conversion for tensors that
+    do not expose the array interface.
+    """
+    row = input_ids[0] if input_ids.ndim > 1 else input_ids
+    arr = np.asarray(row)
+    if arr.dtype == object:
+        # Not a numeric tensor (no array interface); use native conversion.
+        return row.tolist()
+    return arr.tolist()
+
+
+def _text_prompt_sha256(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest()
+
 
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
@@ -1563,6 +1586,9 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model = None
         self._processor = None
         self._tokenizer = None
+        # (sha256(prompt), token_ids) stashed by preflight_chat so the real
+        # chat path can skip a second full tokenize of the same prompt.
+        self._preflight_prompt_ids: tuple[str, list[int]] | None = None
         self._adapter = None
         self._engine = None
         self._loaded = False
@@ -3317,6 +3343,14 @@ class VLMBatchedEngine(BaseEngine):
                 **template_kwargs,
             )
 
+        # Text-only reuse: preflight_chat already tokenized the exact same
+        # rendered prompt for its memory check; reuse those ids rather than
+        # running the full tokenizer again (multi-second on 100K+ prompts).
+        if not images and not audio and isinstance(prompt, str):
+            cached = self._preflight_prompt_ids
+            if cached is not None and cached[0] == _text_prompt_sha256(prompt):
+                return cached[1], None, None, None, 0, []
+
         # Tokenize text and preprocess images and audio
         inputs = prepare_inputs(
             self._processor,
@@ -3555,9 +3589,7 @@ class VLMBatchedEngine(BaseEngine):
             )
 
             # Extract token IDs as list
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
+            token_ids = _ids_tensor_to_list(input_ids)
 
             return (
                 token_ids,
@@ -3569,9 +3601,7 @@ class VLMBatchedEngine(BaseEngine):
             )
         else:
             # Text-only (no images in this message)
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
+            token_ids = _ids_tensor_to_list(input_ids)
             return token_ids, None, None, None, 0, []
 
     def _apply_chat_template(
@@ -4133,7 +4163,10 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            encoded = self._tokenizer.encode(prompt)
+            ids = getattr(encoded, "ids", encoded)
+            num_tokens = len(ids)
+            self._preflight_prompt_ids = (_text_prompt_sha256(prompt), ids)
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
